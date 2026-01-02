@@ -14,10 +14,35 @@ from ..utils import g_config
 from ..utils.singleton import Singleton
 
 
+# Pattern to match base64 data URLs in markdown images: ![...](data:...;base64,...)
+_BASE64_IMAGE_PATTERN = re.compile(
+    r"!\[([^\]]*)\]\(data:image/[^;]+;base64,[A-Za-z0-9+/=]+\)"
+)
+
+# Placeholder to replace base64 images for consistent hashing
+_IMAGE_PLACEHOLDER = "![image](data:image/png;base64,<IMAGE_DATA>)"
+
+
+def _normalize_content_for_hash(content: str | None) -> str | None:
+    """Replace base64 image data URLs with a placeholder for consistent hashing."""
+    if not content or not isinstance(content, str):
+        return content
+    return _BASE64_IMAGE_PATTERN.sub(_IMAGE_PLACEHOLDER, content)
+
+
 def _hash_message(message: Message) -> str:
-    """Generate a hash for a single message."""
+    """Generate a hash for a single message.
+
+    Note: Base64 image data URLs are normalized to ensure consistent hashing
+    across requests containing generated images.
+    """
     # Convert message to dict and sort keys for consistent hashing
     message_dict = message.model_dump(mode="json")
+
+    # Normalize content to replace base64 images with placeholder
+    if "content" in message_dict and isinstance(message_dict["content"], str):
+        message_dict["content"] = _normalize_content_for_hash(message_dict["content"])
+
     message_bytes = orjson.dumps(message_dict, option=orjson.OPT_SORT_KEYS)
     return hashlib.sha256(message_bytes).hexdigest()
 
@@ -430,13 +455,17 @@ class LMDBConversationStore(metaclass=Singleton):
     @staticmethod
     def sanitize_assistant_messages(messages: list[Message]) -> list[Message]:
         """
-        Create a new list of messages with assistant content cleaned of <think> tags.
-        This is useful for store the chat history.
+        Create a new list of messages with assistant content cleaned of <think> tags
+        and base64 image data URLs normalized for consistent hashing.
+        This is useful for storing the chat history.
         """
         cleaned_messages = []
         for msg in messages:
             if msg.role == "assistant" and isinstance(msg.content, str):
+                # Remove think tags first
                 normalized_content = LMDBConversationStore.remove_think_tags(msg.content)
+                # Normalize base64 image data URLs for consistent hashing
+                normalized_content = _normalize_content_for_hash(normalized_content)
                 # Only create a new object if content actually changed
                 if normalized_content != msg.content:
                     cleaned_msg = Message(role=msg.role, content=normalized_content, name=msg.name)
