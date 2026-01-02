@@ -3,6 +3,7 @@ from collections import deque
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set, Tuple
 
+from gemini_webapi.exceptions import AuthError
 from loguru import logger
 
 from ..utils import g_config
@@ -140,6 +141,11 @@ class GeminiClientPool(metaclass=Singleton):
                         refresh_interval=g_config.gemini.refresh_interval,
                     )
                     return client.running()
+                except AuthError as e:
+                    logger.error(f"AuthError for client {client.id}: {e} - disabling account cookies")
+                    # Disable account cookies in database
+                    await self.handle_auth_error(client.id)
+                    return False
                 except Exception:
                     logger.exception(f"Failed to initialize client {client.id}")
                     return False
@@ -249,6 +255,10 @@ class GeminiClientPool(metaclass=Singleton):
                             refresh_interval=g_config.gemini.refresh_interval,
                         )
                         return True
+                    except AuthError as e:
+                        logger.error(f"AuthError for new client {client.id}: {e} - disabling account cookies")
+                        await self.handle_auth_error(client.id)
+                        return False
                     except Exception:
                         logger.exception(f"Failed to initialize new client {client.id}")
                         return False
@@ -416,6 +426,34 @@ class GeminiClientPool(metaclass=Singleton):
                 logger.warning("MySQL store not available, cannot disable account in database")
         except Exception as e:
             logger.error(f"Failed to disable account {client_id} in database: {e}")
+
+    async def handle_auth_error(self, client_id: str) -> None:
+        """
+        Handle AuthError (expired cookies): disable account cookies in database and remove from pool.
+
+        Args:
+            client_id: Client identifier (email)
+        """
+        logger.error(f"Handling auth error (expired cookies) for {client_id}")
+
+        # Add to banned set to prevent reloading
+        self._banned_accounts.add(client_id)
+
+        # Remove from pool first
+        self.remove_client(client_id)
+
+        # Disable cookies in database
+        try:
+            from .mysql_store import get_mysql_store
+
+            store = get_mysql_store()
+            if store:
+                await store.disable_account_web(client_id)
+                logger.warning(f"Disabled Gemini cookies for account with expired auth: {client_id}")
+            else:
+                logger.warning("MySQL store not available, cannot disable account cookies in database")
+        except Exception as e:
+            logger.error(f"Failed to disable cookies for {client_id} in database: {e}")
 
     async def handle_ip_blocked(self, client_id: str) -> None:
         """
@@ -599,6 +637,10 @@ class GeminiClientPool(metaclass=Singleton):
                             refresh_interval=g_config.gemini.refresh_interval,
                         )
                         return True
+                    except AuthError as e:
+                        logger.error(f"AuthError for client {client.id}: {e} - disabling account cookies")
+                        await self.handle_auth_error(client.id)
+                        return False
                     except Exception:
                         logger.exception(f"Failed to initialize new client {client.id}")
                         # Remove failed client from pool

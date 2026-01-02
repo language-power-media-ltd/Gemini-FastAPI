@@ -45,8 +45,6 @@ from ..models import (
 from ..services import GeminiClientPool, GeminiClientWrapper, LMDBConversationStore
 from ..utils import g_config
 from ..utils.helper import (
-    CODE_BLOCK_HINT,
-    CODE_HINT_STRIPPED,
     XML_HINT_STRIPPED,
     XML_WRAP_HINT,
     estimate_tokens,
@@ -180,43 +178,6 @@ def _build_tool_prompt(
     return "\n".join(lines)
 
 
-def _build_image_generation_instruction(
-    tools: list[ResponseImageTool] | None,
-    tool_choice: ResponseToolChoice | None,
-) -> str | None:
-    """Construct explicit guidance so Gemini emits images when requested."""
-    has_forced_choice = tool_choice is not None and tool_choice.type == "image_generation"
-    primary = tools[0] if tools else None
-
-    if not has_forced_choice and primary is None:
-        return None
-
-    instructions: list[str] = [
-        "Image generation is enabled. When the user requests an image, you must return an actual generated image, not a text description.",
-        "For new image requests, generate at least one new image matching the description.",
-        "If the user provides an image and asks for edits or variations, return a newly generated image with the requested changes.",
-        "Avoid all text replies unless a short caption is explicitly requested. Do not explain, apologize, or describe image creation steps.",
-        "Never send placeholder text like 'Here is your image' or any other response without an actual image attachment.",
-    ]
-
-    if primary:
-        if primary.model:
-            instructions.append(
-                f"Where styles differ, favor the `{primary.model}` image model when rendering the scene."
-            )
-        if primary.output_format:
-            instructions.append(
-                f"Encode the image using the `{primary.output_format}` format whenever possible."
-            )
-
-    if has_forced_choice:
-        instructions.append(
-            "Image generation was explicitly requested. You must return at least one generated image. Any response without an image will be treated as a failure."
-        )
-
-    return "\n\n".join(instructions)
-
-
 def _append_xml_hint_to_last_user_message(messages: list[Message]) -> None:
     """Ensure the last user message carries the XML wrap hint."""
     for msg in reversed(messages):
@@ -245,27 +206,6 @@ def _append_xml_hint_to_last_user_message(messages: list[Message]) -> None:
     # No user message to annotate; nothing to do.
 
 
-def _conversation_has_code_hint(messages: list[Message]) -> bool:
-    """Return True if any system message already includes the code block hint."""
-    for msg in messages:
-        if msg.role != "system" or msg.content is None:
-            continue
-
-        if isinstance(msg.content, str):
-            if CODE_HINT_STRIPPED in msg.content:
-                return True
-            continue
-
-        if isinstance(msg.content, list):
-            for part in msg.content:
-                if getattr(part, "type", None) != "text":
-                    continue
-                if part.text and CODE_HINT_STRIPPED in part.text:
-                    return True
-
-    return False
-
-
 def _prepare_messages_for_model(
     source_messages: list[Message],
     tools: list[Tool] | None,
@@ -286,10 +226,6 @@ def _prepare_messages_for_model(
         logger.debug(
             f"Applied {len(extra_instructions)} extra instructions for tool/structured output."
         )
-
-    if not _conversation_has_code_hint(prepared):
-        instructions.append(CODE_BLOCK_HINT)
-        logger.debug("Injected default code block hint for Gemini conversation.")
 
     if not instructions:
         return prepared
@@ -551,16 +487,15 @@ async def create_chat_completion(
                 elif t_type == "image_generation":
                     image_tools.append(ResponseImageTool.model_validate(t))
 
-    # Build image generation instruction if needed
+    # Determine if image generation mode should be enabled
     image_tool_choice = (
         request.tool_choice
         if isinstance(request.tool_choice, ResponseToolChoice)
         else None
     )
-    image_instruction = _build_image_generation_instruction(image_tools, image_tool_choice)
-    if image_instruction:
-        extra_instructions.append(image_instruction)
-        logger.debug("Image generation support enabled for /v1/chat/completions request.")
+    enable_image_generation = bool(image_tools) or (image_tool_choice is not None and image_tool_choice.type == "image_generation")
+    if enable_image_generation:
+        logger.debug("Image generation mode enabled for /v1/chat/completions request.")
 
     # Determine tool_choice for standard tools (ignore image_generation choice here)
     standard_tool_choice = None
@@ -642,12 +577,13 @@ async def create_chat_completion(
             db=db,
             model=model,
             image_store=image_store,
+            image_generation=enable_image_generation,
         )
 
     # Generate response (non-streaming or structured output)
     pool = GeminiClientPool()
     try:
-        response = await _send_with_split(session, model_input, files=files)
+        response = await _send_with_split(session, model_input, files=files, image_generation=enable_image_generation)
     except UsageLimitExceeded as exc:
         logger.warning(f"Usage limit exceeded for client {client_id} on model {request.model}: {exc}")
         # Handle: add cooldown and remove from pool
@@ -836,15 +772,15 @@ async def create_response(
                 elif t_type == "image_generation":
                     image_tools.append(ResponseImageTool.model_validate(t))
 
-    image_instruction = _build_image_generation_instruction(
-        image_tools,
+    # Determine if image generation mode should be enabled
+    response_image_tool_choice = (
         request_data.tool_choice
         if isinstance(request_data.tool_choice, ResponseToolChoice)
-        else None,
+        else None
     )
-    if image_instruction:
-        extra_instructions.append(image_instruction)
-        logger.debug("Image generation support enabled for /v1/responses request.")
+    enable_image_generation = bool(image_tools) or (response_image_tool_choice is not None and response_image_tool_choice.type == "image_generation")
+    if enable_image_generation:
+        logger.debug("Image generation mode enabled for /v1/responses request.")
 
     preface_messages = _instructions_to_messages(request_data.instructions)
     conversation_messages = base_messages
@@ -928,7 +864,7 @@ async def create_response(
         logger.debug(
             f"Client ID: {client_id}, Input length: {len(model_input)}, files count: {len(files)}"
         )
-        model_output = await _send_with_split(session, model_input, files=files)
+        model_output = await _send_with_split(session, model_input, files=files, image_generation=enable_image_generation)
     except UsageLimitExceeded as exc:
         client_id = client.id if client else "unknown"
         logger.warning(f"Usage limit exceeded for client {client_id} on model {request_data.model}: {exc}")
@@ -1023,7 +959,7 @@ async def create_response(
     images = model_output.images or []
     logger.debug(
         f"Gemini returned {len(images)} image(s) for /v1/responses "
-        f"(expects_image={expects_image}, instruction_applied={bool(image_instruction)})."
+        f"(expects_image={expects_image}, image_generation_mode={enable_image_generation})."
     )
     if expects_image and not images:
         summary = assistant_text.strip() if assistant_text else ""
@@ -1034,7 +970,7 @@ async def create_response(
         logger.warning(
             "Image generation requested but Gemini produced no images. "
             f"client_id={client_id}, forced_tool_choice={request_data.tool_choice is not None}, "
-            f"instruction_applied={bool(image_instruction)}, assistant_preview='{summary}'"
+            f"image_generation_mode={enable_image_generation}, assistant_preview='{summary}'"
         )
         detail = "LLM returned no images for the requested image_generation tool."
         if summary:
@@ -1206,7 +1142,12 @@ async def _find_reusable_session(
     return None, None, messages
 
 
-async def _send_with_split(session: ChatSession, text: str, files: list[Path | str] | None = None):
+async def _send_with_split(
+    session: ChatSession,
+    text: str,
+    files: list[Path | str] | None = None,
+    image_generation: bool = False,
+):
     """Send text to Gemini, automatically splitting into multiple batches if it is
     longer than ``MAX_CHARS_PER_REQUEST``.
 
@@ -1214,11 +1155,16 @@ async def _send_with_split(session: ChatSession, text: str, files: list[Path | s
     telling Gemini that more content will come, and it should simply reply with
     "ok". The final batch carries any file uploads and the real user prompt so
     that Gemini can produce the actual answer.
+
+    Parameters
+    ----------
+    image_generation : bool
+        Enable image generation mode (equivalent to "Create images" in Gemini web UI).
     """
     if len(text) <= MAX_CHARS_PER_REQUEST:
         # No need to split - a single request is fine.
         try:
-            return await session.send_message(text, files=files)
+            return await session.send_message(text, files=files, image_generation=image_generation)
         except Exception as e:
             logger.exception(f"Error sending message to Gemini: {e}")
             raise
@@ -1248,7 +1194,7 @@ async def _send_with_split(session: ChatSession, text: str, files: list[Path | s
 
     # The last chunk carries the files (if any) and we return its response.
     try:
-        return await session.send_message(chunks[-1], files=files)
+        return await session.send_message(chunks[-1], files=files, image_generation=image_generation)
     except Exception as e:
         logger.exception(f"Error sending final chunk to Gemini: {e}")
         raise
@@ -1266,8 +1212,15 @@ def _create_real_streaming_response(
     db: "LMDBConversationStore",
     model: Model,
     image_store: Path,
+    image_generation: bool = False,
 ) -> StreamingResponse:
-    """Create a real streaming response using generate_content_stream."""
+    """Create a real streaming response using generate_content_stream.
+
+    Parameters
+    ----------
+    image_generation : bool
+        Enable image generation mode (equivalent to "Create images" in Gemini web UI).
+    """
 
     prompt_tokens = sum(estimate_tokens(text_from_message(msg)) for msg in messages)
 
@@ -1294,6 +1247,7 @@ def _create_real_streaming_response(
                 files=files if files else None,
                 model=model,
                 chat=session,
+                image_generation=image_generation,
             ):
                 final_output = output
 
