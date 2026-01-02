@@ -69,12 +69,25 @@ async def lifespan(app: FastAPI):
             logger.exception("LMDB retention cleanup task failed to start.")
             raise
 
+    # Start auto-refresh task to periodically load new accounts from database
+    try:
+        await pool.start_auto_refresh(interval=300)  # 5 minutes
+        logger.info("Started pool auto-refresh task (interval: 300s)")
+    except Exception as e:
+        logger.warning(f"Failed to start pool auto-refresh task: {e}")
+
     logger.info(f"Gemini clients initialized: {[c.id for c in pool.clients]}.")
     logger.info("Gemini API Server ready to serve requests.")
 
     try:
         yield
     finally:
+        # Stop auto-refresh task
+        try:
+            await pool.stop_auto_refresh()
+        except Exception:
+            logger.exception("Failed to stop pool auto-refresh task.")
+
         cleanup_stop_event.set()
         try:
             await cleanup_task

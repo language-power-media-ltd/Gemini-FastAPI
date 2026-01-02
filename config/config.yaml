@@ -2,8 +2,8 @@
 
 server:
   host: "0.0.0.0"          # Server bind address
-  port: 8000               # Server port
-  api_key: null            # API key for authentication (null for no auth)
+  port: 7860               # Server port
+  api_key: "sk-nUy6X4QdUrg33aaLeJG8P6ev"            # API key for authentication (null for no auth)
   https:
     enabled: false                     # Enable HTTPS
     key_file: "certs/privkey.pem"      # SSL private key file path
@@ -17,11 +17,12 @@ cors:
   allow_headers: ["*"]
 
 gemini:
-  clients:
-    - id: "example-id-1"   # Arbitrary client ID
-      secure_1psid: "YOUR_SECURE_1PSID_HERE"
-      secure_1psidts: "YOUR_SECURE_1PSIDTS_HERE"
-      proxy: null          # Optional proxy URL (null/empty means direct connection)
+  clients: []              # Leave empty when using database, or add manual clients here
+  # Example manual client:
+  # - id: "example-id-1"
+  #   secure_1psid: "YOUR_SECURE_1PSID"
+  #   secure_1psidts: "YOUR_SECURE_1PSIDTS"
+  #   proxy: null
   timeout: 120             # Init timeout in seconds
   auto_refresh: true       # Auto-refresh session cookies
   refresh_interval: 540    # Refresh interval in seconds
@@ -30,10 +31,20 @@ gemini:
   model_strategy: "append" # Strategy: 'append' (default + custom) or 'overwrite' (custom only)
   models: []
 
+# MySQL database configuration (for loading Gemini accounts from Node.js project)
+database:
+  enabled: true            # Enable loading accounts from MySQL database
+  host: "pc-0xi9wt5i9j6z344w2.mysql.polardb.rds.aliyuncs.com"  # MySQL host
+  port: 3306               # MySQL port
+  user: "hiwaifu"          # MySQL username
+  password: "Abc8866123"   # MySQL password
+  database: "a2api"        # Database name
+  sync_cookies: true       # Sync refreshed cookies back to database
+
 storage:
   path: "data/lmdb"        # Database storage path
-  max_size: 268435456      # Maximum database size (256 MB)
-  retention_days: 14       # Number of days to retain conversations before cleanup
+  max_size: 10737418240     # Maximum database size (1 GB)
+  retention_days: 1        # Number of days to retain conversations before cleanup
 
 logging:
-  level: "INFO"            # Log level: DEBUG, INFO, WARNING, ERROR
+  level: "WARNING"            # Log level: DEBUG, INFO, WARNING, ERROR

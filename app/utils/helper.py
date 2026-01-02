@@ -269,11 +269,15 @@ def extract_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
 
 
 def iter_stream_segments(model_output: str, chunk_size: int = 64) -> Iterator[str]:
-    """Yield stream segments while keeping <think> markers and words intact."""
+    """Yield stream segments while keeping <think> markers, words, and base64 images intact."""
     if not model_output:
         return
 
     token_pattern = re.compile(r"\s+|\S+\s*")
+    # Pattern to match markdown base64 images: ![...](data:...;base64,...)
+    # Using [^\)]+ to match all characters until the closing parenthesis for better performance
+    # with very long base64 strings
+    base64_image_pattern = re.compile(r"!\[[^\]]*\]\(data:[^)]+\)")
     pending = ""
 
     def _flush_pending() -> Iterator[str]:
@@ -282,29 +286,46 @@ def iter_stream_segments(model_output: str, chunk_size: int = 64) -> Iterator[st
             yield pending
             pending = ""
 
-    # Split on <think> boundaries so the markers are never fragmented.
-    parts = re.split(r"(</?think>)", model_output)
-    for part in parts:
-        if not part:
+    # First, split on base64 images to keep them intact
+    # This regex splits but keeps the delimiter (the base64 image) in the result
+    # Using findall + split approach to handle multiple images correctly
+    image_split_pattern = re.compile(r"(!\[[^\]]*\]\(data:[^)]+\))")
+    image_parts = image_split_pattern.split(model_output)
+
+    for image_part in image_parts:
+        if not image_part:
             continue
-        if part in {"<think>", "</think>"}:
+
+        # If this part is a base64 image, yield it as a single chunk
+        if base64_image_pattern.fullmatch(image_part):
             yield from _flush_pending()
-            yield part
+            yield image_part
             continue
 
-        for match in token_pattern.finditer(part):
-            token = match.group(0)
-
-            if len(token) > chunk_size:
+        # Otherwise, process as before with <think> boundaries
+        # Split on <think> boundaries so the markers are never fragmented.
+        parts = re.split(r"(</?think>)", image_part)
+        for part in parts:
+            if not part:
+                continue
+            if part in {"<think>", "</think>"}:
                 yield from _flush_pending()
-                for idx in range(0, len(token), chunk_size):
-                    yield token[idx : idx + chunk_size]
+                yield part
                 continue
 
-            if pending and len(pending) + len(token) > chunk_size:
-                yield from _flush_pending()
+            for match in token_pattern.finditer(part):
+                token = match.group(0)
 
-            pending += token
+                if len(token) > chunk_size:
+                    yield from _flush_pending()
+                    for idx in range(0, len(token), chunk_size):
+                        yield token[idx : idx + chunk_size]
+                    continue
+
+                if pending and len(pending) + len(token) > chunk_size:
+                    yield from _flush_pending()
+
+                pending += token
 
     yield from _flush_pending()
 

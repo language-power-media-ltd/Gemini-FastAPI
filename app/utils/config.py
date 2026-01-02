@@ -76,7 +76,7 @@ class GeminiConfig(BaseModel):
     """Gemini API configuration"""
 
     clients: list[GeminiClientSettings] = Field(
-        ..., description="List of Gemini client credential pairs"
+        default=[], description="List of Gemini client credential pairs (can be empty if using database)"
     )
     models: list[GeminiModelConfig] = Field(default=[], description="List of custom Gemini models")
     model_strategy: Literal["append", "overwrite"] = Field(
@@ -129,6 +129,41 @@ class CORSConfig(BaseModel):
     )
 
 
+class DatabaseConfig(BaseModel):
+    """MySQL Database configuration for loading Gemini accounts from Node.js project."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable loading Gemini accounts from MySQL database",
+    )
+    host: str = Field(
+        default="localhost",
+        description="MySQL server host",
+    )
+    port: int = Field(
+        default=3306,
+        ge=1,
+        le=65535,
+        description="MySQL server port",
+    )
+    user: str = Field(
+        default="root",
+        description="MySQL username",
+    )
+    password: str = Field(
+        default="",
+        description="MySQL password",
+    )
+    database: str = Field(
+        default="a2api",
+        description="MySQL database name",
+    )
+    sync_cookies: bool = Field(
+        default=True,
+        description="Sync refreshed cookies back to database",
+    )
+
+
 class StorageConfig(BaseModel):
     """LMDB Storage configuration"""
 
@@ -178,6 +213,12 @@ class Config(BaseSettings):
     storage: StorageConfig = Field(
         default=StorageConfig(),
         description="Storage configuration, defines where and how data will be stored",
+    )
+
+    # Database configuration (for loading accounts from Node.js project)
+    database: DatabaseConfig = Field(
+        default=DatabaseConfig(),
+        description="MySQL database configuration for loading Gemini accounts",
     )
 
     # Logging configuration

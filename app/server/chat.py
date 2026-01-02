@@ -12,7 +12,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from gemini_webapi.client import ChatSession
 from gemini_webapi.constants import Model
-from gemini_webapi.exceptions import APIError
+from gemini_webapi.exceptions import (
+    AccountBanned,
+    APIError,
+    TemporarilyBlocked,
+    UsageLimitExceeded,
+)
 from gemini_webapi.types.image import GeneratedImage, Image
 from loguru import logger
 
@@ -524,7 +529,45 @@ async def create_chat_completion(
             f"Structured response requested for /v1/chat/completions (schema={structured_requirement.schema_name})."
         )
 
-    extra_instructions = [structured_requirement.instruction] if structured_requirement else None
+    extra_instructions: list[str] = []
+    if structured_requirement:
+        extra_instructions.append(structured_requirement.instruction)
+
+    # Separate standard tools from image generation tools
+    standard_tools: list[Tool] = []
+    image_tools: list[ResponseImageTool] = []
+
+    if request.tools:
+        for t in request.tools:
+            if isinstance(t, Tool):
+                standard_tools.append(t)
+            elif isinstance(t, ResponseImageTool):
+                image_tools.append(t)
+            # Handle dicts if Pydantic didn't convert them fully (fallback)
+            elif isinstance(t, dict):
+                t_type = t.get("type")
+                if t_type == "function":
+                    standard_tools.append(Tool.model_validate(t))
+                elif t_type == "image_generation":
+                    image_tools.append(ResponseImageTool.model_validate(t))
+
+    # Build image generation instruction if needed
+    image_tool_choice = (
+        request.tool_choice
+        if isinstance(request.tool_choice, ResponseToolChoice)
+        else None
+    )
+    image_instruction = _build_image_generation_instruction(image_tools, image_tool_choice)
+    if image_instruction:
+        extra_instructions.append(image_instruction)
+        logger.debug("Image generation support enabled for /v1/chat/completions request.")
+
+    # Determine tool_choice for standard tools (ignore image_generation choice here)
+    standard_tool_choice = None
+    if isinstance(request.tool_choice, str):
+        standard_tool_choice = request.tool_choice
+    elif isinstance(request.tool_choice, ToolChoiceFunction):
+        standard_tool_choice = request.tool_choice
 
     # Check if conversation is reusable
     session, client, remaining_messages = await _find_reusable_session(
@@ -533,7 +576,10 @@ async def create_chat_completion(
 
     if session:
         messages_to_send = _prepare_messages_for_model(
-            remaining_messages, request.tools, request.tool_choice, extra_instructions
+            remaining_messages,
+            standard_tools or None,
+            standard_tool_choice,
+            extra_instructions or None,
         )
         if not messages_to_send:
             raise HTTPException(
@@ -557,7 +603,10 @@ async def create_chat_completion(
             client = await pool.acquire()
             session = client.start_chat(model=model)
             messages_to_send = _prepare_messages_for_model(
-                request.messages, request.tools, request.tool_choice, extra_instructions
+                request.messages,
+                standard_tools or None,
+                standard_tool_choice,
+                extra_instructions or None,
             )
             model_input, files = await GeminiClientWrapper.process_conversation(
                 messages_to_send, tmp_dir
@@ -571,16 +620,59 @@ async def create_chat_completion(
             raise
         logger.debug("New session started.")
 
-    # Generate response
-    try:
-        assert session and client, "Session and client not available"
-        client_id = client.id
-        logger.debug(
-            f"Client ID: {client_id}, Input length: {len(model_input)}, files count: {len(files)}"
+    assert session and client, "Session and client not available"
+    client_id = client.id
+    logger.debug(
+        f"Client ID: {client_id}, Input length: {len(model_input)}, files count: {len(files)}"
+    )
+
+    # For streaming requests, use real streaming interface
+    if request.stream and not structured_requirement:
+        completion_id = f"chatcmpl-{uuid.uuid4()}"
+        timestamp = int(datetime.now(tz=timezone.utc).timestamp())
+        return _create_real_streaming_response(
+            client=client,
+            session=session,
+            model_input=model_input,
+            files=files,
+            completion_id=completion_id,
+            created_time=timestamp,
+            model_name=request.model,
+            messages=request.messages,
+            db=db,
+            model=model,
+            image_store=image_store,
         )
+
+    # Generate response (non-streaming or structured output)
+    pool = GeminiClientPool()
+    try:
         response = await _send_with_split(session, model_input, files=files)
+    except UsageLimitExceeded as exc:
+        logger.warning(f"Usage limit exceeded for client {client_id} on model {request.model}: {exc}")
+        # Handle: add cooldown and remove from pool
+        await pool.handle_usage_limit_exceeded(client_id, request.model)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Usage limit exceeded for this account. Please try again later.",
+        ) from exc
+    except AccountBanned as exc:
+        logger.error(f"Account banned for client {client_id}: {exc}")
+        # Handle: disable account in database and remove from pool
+        await pool.handle_account_banned(client_id)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account has been banned. Please use a different account.",
+        ) from exc
+    except TemporarilyBlocked as exc:
+        logger.warning(f"IP temporarily blocked for client {client_id}: {exc}")
+        # Handle: change proxy and reload client
+        await pool.handle_ip_blocked(client_id)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="IP temporarily blocked. Proxy has been changed, please retry.",
+        ) from exc
     except APIError as exc:
-        client_id = client.id if client else "unknown"
         logger.warning(f"Gemini API returned invalid response for client {client_id}: {exc}")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -597,8 +689,7 @@ async def create_chat_completion(
 
     # Format the response from API
     try:
-        raw_output_with_think = GeminiClientWrapper.extract_output(response, include_thoughts=True)
-        raw_output_clean = GeminiClientWrapper.extract_output(response, include_thoughts=False)
+        reasoning_content, raw_output_clean = GeminiClientWrapper.extract_output_with_reasoning(response)
     except IndexError as exc:
         logger.exception("Gemini output parsing failed (IndexError).")
         raise HTTPException(
@@ -612,9 +703,26 @@ async def create_chat_completion(
             detail="Gemini output parsing failed unexpectedly.",
         ) from exc
 
-    visible_output, tool_calls = extract_tool_calls(raw_output_with_think)
+    visible_output, tool_calls = extract_tool_calls(raw_output_clean)
     storage_output = remove_tool_call_blocks(raw_output_clean).strip()
     tool_calls_payload = [call.model_dump(mode="json") for call in tool_calls]
+
+    # Process images from response (compatible with Node.js project format)
+    images = response.images or []
+    if images:
+        logger.debug(f"Gemini returned {len(images)} image(s) for /v1/chat/completions")
+        images_markdown = await _images_to_markdown(images, image_store)
+        if images_markdown:
+            # Append images to output with proper spacing
+            if visible_output:
+                visible_output = visible_output.rstrip() + "\n\n" + images_markdown
+            else:
+                visible_output = images_markdown
+            # Also update storage_output for conversation history
+            if storage_output:
+                storage_output = storage_output.rstrip() + "\n\n" + images_markdown
+            else:
+                storage_output = images_markdown
 
     if structured_requirement:
         cleaned_visible = strip_code_fence(visible_output or "")
@@ -662,10 +770,11 @@ async def create_chat_completion(
         # We can still return the response even if saving fails
         logger.warning(f"Failed to save conversation to LMDB: {e}")
 
-    # Return with streaming or standard response
+    # Return standard response (streaming with structured output falls back to pseudo-streaming)
     completion_id = f"chatcmpl-{uuid.uuid4()}"
     timestamp = int(datetime.now(tz=timezone.utc).timestamp())
     if request.stream:
+        # Structured output with streaming - use pseudo-streaming
         return _create_streaming_response(
             visible_output,
             tool_calls_payload,
@@ -673,6 +782,7 @@ async def create_chat_completion(
             timestamp,
             request.model,
             request.messages,
+            reasoning_content=reasoning_content,
         )
     else:
         return _create_standard_response(
@@ -682,6 +792,7 @@ async def create_chat_completion(
             timestamp,
             request.model,
             request.messages,
+            reasoning_content=reasoning_content,
         )
 
 
@@ -818,6 +929,30 @@ async def create_response(
             f"Client ID: {client_id}, Input length: {len(model_input)}, files count: {len(files)}"
         )
         model_output = await _send_with_split(session, model_input, files=files)
+    except UsageLimitExceeded as exc:
+        client_id = client.id if client else "unknown"
+        logger.warning(f"Usage limit exceeded for client {client_id} on model {request_data.model}: {exc}")
+        await pool.handle_usage_limit_exceeded(client_id, request_data.model)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Usage limit exceeded for this account. Please try again later.",
+        ) from exc
+    except AccountBanned as exc:
+        client_id = client.id if client else "unknown"
+        logger.error(f"Account banned for client {client_id}: {exc}")
+        await pool.handle_account_banned(client_id)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account has been banned. Please use a different account.",
+        ) from exc
+    except TemporarilyBlocked as exc:
+        client_id = client.id if client else "unknown"
+        logger.warning(f"IP temporarily blocked for client {client_id}: {exc}")
+        await pool.handle_ip_blocked(client_id)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="IP temporarily blocked. Proxy has been changed, please retry.",
+        ) from exc
     except APIError as exc:
         client_id = client.id if client else "unknown"
         logger.warning(f"Gemini API returned invalid response for client {client_id}: {exc}")
@@ -1119,6 +1254,186 @@ async def _send_with_split(session: ChatSession, text: str, files: list[Path | s
         raise
 
 
+def _create_real_streaming_response(
+    client: GeminiClientWrapper,
+    session: ChatSession,
+    model_input: str,
+    files: list[Path | str],
+    completion_id: str,
+    created_time: int,
+    model_name: str,
+    messages: list[Message],
+    db: "LMDBConversationStore",
+    model: Model,
+    image_store: Path,
+) -> StreamingResponse:
+    """Create a real streaming response using generate_content_stream."""
+
+    prompt_tokens = sum(estimate_tokens(text_from_message(msg)) for msg in messages)
+
+    async def generate_stream():
+        accumulated_text = ""
+        accumulated_thoughts = ""
+        final_output = None
+        completion_tokens = 0
+        all_images = []
+
+        # Send start event with role
+        data = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created_time,
+            "model": model_name,
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+        }
+        yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
+
+        try:
+            async for output in client.generate_content_stream(
+                model_input,
+                files=files if files else None,
+                model=model,
+                chat=session,
+            ):
+                final_output = output
+
+                # Collect images from the output
+                if output.images:
+                    all_images = output.images
+
+                # Stream delta_thoughts as reasoning_content
+                if output.delta_thoughts:
+                    data = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": {"reasoning_content": output.delta_thoughts}, "finish_reason": None}],
+                    }
+                    yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
+                    accumulated_thoughts += output.delta_thoughts
+
+                # Stream delta_text as content
+                if output.delta_text:
+                    data = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": {"content": output.delta_text}, "finish_reason": None}],
+                    }
+                    yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
+                    accumulated_text += output.delta_text
+
+        except UsageLimitExceeded as e:
+            logger.warning(f"Usage limit exceeded during streaming for client {client.id} on model {model_name}: {e}")
+            pool = GeminiClientPool()
+            await pool.handle_usage_limit_exceeded(client.id, model_name)
+            error_data = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {"content": f"\n\n[Error: Usage limit exceeded. Account cooldown applied.]"}, "finish_reason": "error"}],
+            }
+            yield f"data: {orjson.dumps(error_data).decode('utf-8')}\n\n"
+        except AccountBanned as e:
+            logger.error(f"Account banned during streaming for client {client.id}: {e}")
+            pool = GeminiClientPool()
+            await pool.handle_account_banned(client.id)
+            error_data = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {"content": f"\n\n[Error: Account has been banned.]"}, "finish_reason": "error"}],
+            }
+            yield f"data: {orjson.dumps(error_data).decode('utf-8')}\n\n"
+        except TemporarilyBlocked as e:
+            logger.warning(f"IP temporarily blocked during streaming for client {client.id}: {e}")
+            pool = GeminiClientPool()
+            await pool.handle_ip_blocked(client.id)
+            error_data = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {"content": f"\n\n[Error: IP temporarily blocked. Proxy changed, please retry.]"}, "finish_reason": "error"}],
+            }
+            yield f"data: {orjson.dumps(error_data).decode('utf-8')}\n\n"
+        except Exception as e:
+            logger.exception(f"Error during streaming: {e}")
+            # Send error as a content chunk
+            error_data = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {"content": f"\n\n[Error: {str(e)}]"}, "finish_reason": None}],
+            }
+            yield f"data: {orjson.dumps(error_data).decode('utf-8')}\n\n"
+
+        # Process images at the end of streaming
+        if all_images:
+            try:
+                images_markdown = await _images_to_markdown(all_images, image_store)
+                if images_markdown:
+                    # Send images as final content chunk
+                    data = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": {"content": "\n\n" + images_markdown}, "finish_reason": None}],
+                    }
+                    yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
+                    accumulated_text += "\n\n" + images_markdown
+            except Exception as e:
+                logger.warning(f"Failed to process images during streaming: {e}")
+
+        # Calculate final token usage
+        reasoning_tokens = len(accumulated_thoughts) // 4 if accumulated_thoughts else 0
+        completion_tokens = estimate_tokens(accumulated_text) + reasoning_tokens
+        total_tokens = prompt_tokens + completion_tokens
+
+        # Send end event
+        data = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created_time,
+            "model": model_name,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+            },
+        }
+        yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
+        yield "data: [DONE]\n\n"
+
+        # Save conversation to DB after streaming completes
+        if final_output:
+            try:
+                storage_output = accumulated_text.strip()
+                last_message = Message(
+                    role="assistant",
+                    content=storage_output or None,
+                )
+                cleaned_history = db.sanitize_assistant_messages(messages)
+                conv = ConversationInStore(
+                    model=model.model_name,
+                    client_id=client.id,
+                    metadata=session.metadata,
+                    messages=[*cleaned_history, last_message],
+                )
+                db.store(conv)
+            except Exception as e:
+                logger.warning(f"Failed to save conversation to LMDB after streaming: {e}")
+
+    return StreamingResponse(generate_stream(), media_type="text/event-stream")
+
+
 def _create_streaming_response(
     model_output: str,
     tool_calls: list[dict],
@@ -1126,13 +1441,15 @@ def _create_streaming_response(
     created_time: int,
     model: str,
     messages: list[Message],
+    reasoning_content: str | None = None,
 ) -> StreamingResponse:
     """Create streaming response with `usage` calculation included in the final chunk."""
 
     # Calculate token usage
     prompt_tokens = sum(estimate_tokens(text_from_message(msg)) for msg in messages)
     tool_args = "".join(call.get("function", {}).get("arguments", "") for call in tool_calls or [])
-    completion_tokens = estimate_tokens(model_output + tool_args)
+    reasoning_tokens = len(reasoning_content) // 4 if reasoning_content else 0
+    completion_tokens = estimate_tokens(model_output + tool_args) + reasoning_tokens
     total_tokens = prompt_tokens + completion_tokens
     finish_reason = "tool_calls" if tool_calls else "stop"
 
@@ -1146,6 +1463,18 @@ def _create_streaming_response(
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
         }
         yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
+
+        # Stream reasoning_content first if present
+        if reasoning_content:
+            for chunk in iter_stream_segments(reasoning_content):
+                data = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"reasoning_content": chunk}, "finish_reason": None}],
+                }
+                yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
 
         # Stream output text in chunks for efficiency
         for chunk in iter_stream_segments(model_output):
@@ -1308,16 +1637,20 @@ def _create_standard_response(
     created_time: int,
     model: str,
     messages: list[Message],
+    reasoning_content: str | None = None,
 ) -> dict:
     """Create standard response"""
     # Calculate token usage
     prompt_tokens = sum(estimate_tokens(text_from_message(msg)) for msg in messages)
     tool_args = "".join(call.get("function", {}).get("arguments", "") for call in tool_calls or [])
-    completion_tokens = estimate_tokens(model_output + tool_args)
+    reasoning_tokens = len(reasoning_content) // 4 if reasoning_content else 0
+    completion_tokens = estimate_tokens(model_output + tool_args) + reasoning_tokens
     total_tokens = prompt_tokens + completion_tokens
     finish_reason = "tool_calls" if tool_calls else "stop"
 
     message_payload: dict = {"role": "assistant", "content": model_output or None}
+    if reasoning_content:
+        message_payload["reasoning_content"] = reasoning_content
     if tool_calls:
         message_payload["tool_calls"] = tool_calls
 
@@ -1368,3 +1701,32 @@ async def _image_to_base64(image: Image, temp_dir: Path) -> tuple[str, int | Non
     width, height = extract_image_dimensions(data)
     filename = random_name
     return base64.b64encode(data).decode("ascii"), width, height, filename
+
+
+async def _images_to_markdown(images: list[Image], temp_dir: Path) -> str:
+    """Convert images to markdown format with base64 data URLs, compatible with Node.js project format."""
+    if not images:
+        return ""
+
+    markdown_parts: list[str] = []
+    for image in images:
+        try:
+            image_base64, _, _, filename = await _image_to_base64(image, temp_dir)
+            # Determine MIME type based on file extension
+            suffix = Path(filename).suffix.lower()
+            if suffix == ".png":
+                mime_type = "image/png"
+            elif suffix in (".jpg", ".jpeg"):
+                mime_type = "image/jpeg"
+            elif suffix == ".gif":
+                mime_type = "image/gif"
+            elif suffix == ".webp":
+                mime_type = "image/webp"
+            else:
+                mime_type = "image/png"  # Default to PNG
+            markdown_parts.append(f"![image](data:{mime_type};base64,{image_base64})")
+        except Exception as exc:
+            logger.warning(f"Failed to convert image to markdown: {exc}")
+            continue
+
+    return "\n\n".join(markdown_parts)

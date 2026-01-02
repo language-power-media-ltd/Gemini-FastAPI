@@ -111,9 +111,15 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 1.0
     max_tokens: Optional[int] = None
-    tools: Optional[List["Tool"]] = None
+    tools: Optional[List[Union["Tool", "ResponseImageTool"]]] = None
     tool_choice: Optional[
-        Union[Literal["none"], Literal["auto"], Literal["required"], "ToolChoiceFunction"]
+        Union[
+            Literal["none"],
+            Literal["auto"],
+            Literal["required"],
+            "ToolChoiceFunction",
+            "ResponseToolChoice",
+        ]
     ] = None
     response_format: Optional[Dict[str, Any]] = None
 

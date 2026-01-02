@@ -1,3 +1,6 @@
+from datetime import datetime
+from typing import Any, Dict, List
+
 from fastapi import APIRouter
 from loguru import logger
 
@@ -31,3 +34,35 @@ async def health_check():
         )
 
     return HealthCheckResponse(ok=all(client_status.values()), storage=stat, clients=client_status)
+
+
+@router.get("/pool/status")
+async def get_pool_status() -> Dict[str, Any]:
+    """Get detailed pool status including all clients and cooldowns."""
+    pool = GeminiClientPool()
+
+    # Get pool stats
+    stats = pool.get_pool_stats()
+
+    # Get detailed client list
+    clients: List[Dict[str, Any]] = []
+    for client in pool.clients:
+        clients.append({
+            "id": client.id,
+            "running": client.running(),
+            "proxy": client.proxy[:50] + "..." if client.proxy and len(client.proxy) > 50 else client.proxy,
+        })
+
+    # Get cooldown status
+    cooldowns = pool.get_cooldown_status()
+
+    # Get banned accounts
+    banned_accounts = list(pool._banned_accounts)
+
+    return {
+        "stats": stats,
+        "clients": clients,
+        "cooldowns": cooldowns,
+        "banned_accounts": banned_accounts,
+        "timestamp": datetime.now().isoformat(),
+    }

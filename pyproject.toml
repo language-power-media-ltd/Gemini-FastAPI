@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "gemini-fastapi"
 version = "1.0.0"
@@ -6,12 +10,13 @@ readme = "README.md"
 requires-python = "==3.12.*"
 dependencies = [
     "fastapi>=0.115.12",
-    "gemini-webapi>=1.17.0",
+    "gemini-webapi @ file:///www/antigravity2api/Gemini-API",
     "lmdb>=1.6.2",
     "loguru>=0.7.0",
     "pydantic-settings[yaml]>=2.9.1",
     "uvicorn>=0.34.1",
     "uvloop>=0.21.0; sys_platform != 'win32'",
+    "aiomysql>=0.2.0",
 ]
 
 [project.optional-dependencies]
@@ -32,3 +37,6 @@ indent-style = "space"
 dev = [
     "ruff>=0.11.13",
 ]
+
+[tool.setuptools.packages.find]
+include = ["app*", "config*"]

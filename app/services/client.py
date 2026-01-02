@@ -36,7 +36,7 @@ class GeminiClientWrapper(GeminiClient):
     """Gemini client with helper methods."""
 
     def __init__(self, client_id: str, **kwargs):
-        super().__init__(**kwargs)
+        super().__init__(client_id=client_id, **kwargs)
         self.id = client_id
 
     async def init(
@@ -178,19 +178,33 @@ class GeminiClientWrapper(GeminiClient):
     def extract_output(response: ModelOutput, include_thoughts: bool = True) -> str:
         """
         Extract and format the output text from the Gemini response.
+        
+        Note: This method wraps thoughts in <think> tags. For OpenAI-compatible
+        reasoning_content format, use extract_output_with_reasoning() instead.
         """
-        text = ""
+        reasoning, text = GeminiClientWrapper.extract_output_with_reasoning(response)
+        
+        if include_thoughts and reasoning:
+            return f"<think>{reasoning}</think>\n{text}"
+        return text
 
-        if include_thoughts and response.thoughts:
-            text += f"<think>{response.thoughts}</think>\n"
-
+    @staticmethod
+    def extract_output_with_reasoning(response: ModelOutput) -> tuple[str | None, str]:
+        """
+        Extract output text and reasoning (thoughts) separately from the Gemini response.
+        
+        Returns:
+            tuple[str | None, str]: (reasoning_content, text_content)
+        """
+        reasoning = response.thoughts if response.thoughts else None
+        
         if response.text:
-            text += response.text
+            text = response.text
         else:
-            text += str(response)
+            text = str(response)
 
-        # Fix some escaped characters
-        def _unescape_html(text_content: str) -> str:
+        # Fix some escaped characters (for text)
+        def _unescape_html_inline(text_content: str) -> str:
             parts: list[str] = []
             last_index = 0
             for match in CODE_FENCE_RE.finditer(text_content):
@@ -204,7 +218,7 @@ class GeminiClientWrapper(GeminiClient):
                 parts.append(HTML_ESCAPE_RE.sub(lambda m: html.unescape(m.group(0)), tail))
             return "".join(parts)
 
-        def _unescape_markdown(text_content: str) -> str:
+        def _unescape_markdown_inline(text_content: str) -> str:
             parts: list[str] = []
             last_index = 0
             for match in CODE_FENCE_RE.finditer(text_content):
@@ -218,28 +232,28 @@ class GeminiClientWrapper(GeminiClient):
                 parts.append(MARKDOWN_ESCAPE_RE.sub("", tail))
             return "".join(parts)
 
-        text = _unescape_html(text)
-        text = _unescape_markdown(text)
+        text = _unescape_html_inline(text)
+        text = _unescape_markdown_inline(text)
 
-        def extract_file_path_from_display_text(text_content: str) -> str | None:
+        def extract_file_path_from_display_text_inline(text_content: str) -> str | None:
             match = re.match(FILE_PATH_PATTERN, text_content)
             if match:
                 return match.group(1)
             return None
 
-        def replacer(match: re.Match) -> str:
+        def replacer_inline(match: re.Match) -> str:
             display_text = str(match.group(1)).strip()
             google_search_prefix = match.group(2)
             query_part = match.group(3)
 
-            file_path = extract_file_path_from_display_text(display_text)
+            file_path = extract_file_path_from_display_text_inline(display_text)
 
             if file_path:
-                # If it's a file path, transform it into a self-referencing Markdown link
                 return f"[`{file_path}`]({file_path})"
             else:
-                # Otherwise, reconstruct the original Google search link with the display_text
                 original_google_search_url = f"{google_search_prefix}{query_part}"
                 return f"[`{display_text}`]({original_google_search_url})"
 
-        return re.sub(GOOGLE_SEARCH_LINK_PATTERN, replacer, text)
+        text = re.sub(GOOGLE_SEARCH_LINK_PATTERN, replacer_inline, text)
+        
+        return reasoning, text
