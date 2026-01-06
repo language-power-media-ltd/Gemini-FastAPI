@@ -681,3 +681,244 @@ class GeminiClientPool(metaclass=Singleton):
             "auto_refresh_running": self._auto_refresh_task is not None and not self._auto_refresh_task.done(),
             "auto_refresh_interval": self._auto_refresh_interval,
         }
+
+    def remove_stopped_clients(self) -> dict:
+        """
+        Remove all stopped (non-running) clients from the pool.
+
+        Returns:
+            Dictionary with removal results.
+        """
+        stopped_clients = [c for c in self._clients if not c.running()]
+        removed = []
+        failed = []
+
+        for client in stopped_clients:
+            try:
+                if self.remove_client(client.id):
+                    removed.append(client.id)
+                else:
+                    failed.append(client.id)
+            except Exception as e:
+                logger.error(f"Error removing stopped client {client.id}: {e}")
+                failed.append(client.id)
+
+        logger.info(f"Removed {len(removed)} stopped clients from pool")
+        return {
+            "removed": removed,
+            "failed": failed,
+            "removed_count": len(removed),
+            "failed_count": len(failed),
+        }
+
+    def remove_clients_by_domain(self, domain: str) -> dict:
+        """
+        Remove all clients matching a specific email domain from the pool.
+
+        Args:
+            domain: Email domain to match (e.g., 'gmail.com', 'example.com')
+
+        Returns:
+            Dictionary with removal results.
+        """
+        if not domain:
+            return {"removed": [], "failed": [], "removed_count": 0, "failed_count": 0, "error": "Domain is required"}
+
+        # Normalize domain
+        domain = domain.lower().strip()
+        if domain.startswith("@"):
+            domain = domain[1:]
+
+        matching_clients = [c for c in self._clients if c.id.lower().endswith(f"@{domain}")]
+        removed = []
+        failed = []
+
+        for client in matching_clients:
+            try:
+                if self.remove_client(client.id):
+                    removed.append(client.id)
+                else:
+                    failed.append(client.id)
+            except Exception as e:
+                logger.error(f"Error removing client {client.id} by domain: {e}")
+                failed.append(client.id)
+
+        logger.info(f"Removed {len(removed)} clients with domain @{domain} from pool")
+        return {
+            "removed": removed,
+            "failed": failed,
+            "removed_count": len(removed),
+            "failed_count": len(failed),
+            "domain": domain,
+        }
+
+    def get_domains(self) -> dict:
+        """
+        Get all unique email domains in the pool with their counts.
+
+        Returns:
+            Dictionary mapping domains to their client counts.
+        """
+        domain_counts: Dict[str, int] = {}
+        for client in self._clients:
+            email = client.id.lower()
+            if "@" in email:
+                domain = email.split("@")[1]
+                domain_counts[domain] = domain_counts.get(domain, 0) + 1
+        return domain_counts
+
+    def record_request(self, client_id: str, success: bool = True, error: str | None = None) -> None:
+        """
+        Record a request for a specific client.
+
+        Args:
+            client_id: Client identifier (email)
+            success: Whether the request was successful
+            error: Error message if the request failed
+        """
+        client = self._id_map.get(client_id)
+        if client:
+            client.record_request(success, error)
+
+    def get_client_stats(self, client_id: str) -> Optional[dict]:
+        """
+        Get statistics for a specific client.
+
+        Args:
+            client_id: Client identifier (email)
+
+        Returns:
+            Client statistics dictionary or None if not found.
+        """
+        client = self._id_map.get(client_id)
+        if client:
+            return client.get_stats()
+        return None
+
+    def get_all_client_stats(self) -> Dict[str, dict]:
+        """
+        Get statistics for all clients.
+
+        Returns:
+            Dictionary mapping client IDs to their statistics.
+        """
+        return {client.id: client.get_stats() for client in self._clients}
+
+    async def reinit_all_clients(self) -> dict:
+        """
+        Reinitialize stopped clients by fetching fresh cookies from database (one-click login).
+        Already running clients will be skipped.
+        Stopped clients will be removed and recreated with fresh cookies from database.
+
+        Returns:
+            Dictionary with reinitialization results.
+        """
+        results = {
+            "success": [],
+            "failed": [],
+            "skipped": [],
+            "total": len(self._clients),
+        }
+
+        if not self._clients:
+            return results
+
+        # Separate running and stopped clients
+        stopped_client_ids = [c.id for c in self._clients if not c.running()]
+        running_clients = [c for c in self._clients if c.running()]
+
+        # Add running clients to skipped list
+        for client in running_clients:
+            results["skipped"].append(client.id)
+
+        if not stopped_client_ids:
+            logger.info(f"All {len(running_clients)} clients are already running, nothing to reinitialize")
+            return results
+
+        # Fetch fresh cookies from database
+        db_accounts: Dict[str, "GeminiClientSettings"] = {}
+        if g_config.database.enabled:
+            try:
+                from .mysql_store import get_mysql_store
+                store = get_mysql_store()
+                if store:
+                    accounts = await store.get_gemini_accounts()
+                    db_accounts = {acc.id: acc for acc in accounts}
+                    logger.info(f"Fetched {len(db_accounts)} accounts with fresh cookies from database")
+            except Exception as e:
+                logger.error(f"Failed to fetch accounts from database: {e}")
+                # Return early if database fetch failed
+                for client_id in stopped_client_ids:
+                    results["failed"].append({"id": client_id, "error": "Failed to fetch cookies from database"})
+                return results
+
+        # Remove stopped clients first
+        for client_id in stopped_client_ids:
+            self.remove_client(client_id)
+
+        # Use semaphore to limit concurrent initializations
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_INIT)
+
+        async def create_and_init_client(client_id: str) -> tuple[str, bool, str]:
+            """Create and initialize a client with fresh cookies from database."""
+            async with semaphore:
+                try:
+                    if client_id not in db_accounts:
+                        return (client_id, False, "No cookies found in database")
+
+                    db_account = db_accounts[client_id]
+
+                    # Create new client with fresh cookies
+                    new_client = GeminiClientWrapper(
+                        client_id=db_account.id,
+                        secure_1psid=db_account.secure_1psid,
+                        secure_1psidts=db_account.secure_1psidts,
+                        proxy=db_account.proxy,
+                    )
+
+                    # Add to pool
+                    self._clients.append(new_client)
+                    self._id_map[db_account.id] = new_client
+                    self._round_robin.append(new_client)
+                    self._restart_locks[db_account.id] = asyncio.Lock()
+
+                    # Initialize
+                    await new_client.init(
+                        timeout=g_config.gemini.timeout,
+                        auto_refresh=g_config.gemini.auto_refresh,
+                        verbose=g_config.gemini.verbose,
+                        refresh_interval=g_config.gemini.refresh_interval,
+                    )
+                    logger.info(f"Successfully reinitialized client {client_id} with fresh cookies")
+                    return (client_id, True, "")
+                except AuthError as e:
+                    logger.error(f"AuthError for client {client_id}: {e}")
+                    # Remove failed client from pool
+                    self.remove_client(client_id)
+                    return (client_id, False, f"AuthError: {str(e)}")
+                except Exception as e:
+                    logger.exception(f"Failed to reinitialize client {client_id}")
+                    # Remove failed client from pool
+                    self.remove_client(client_id)
+                    return (client_id, False, str(e))
+
+        # Reinitialize only stopped clients concurrently
+        logger.info(f"Reinitializing {len(stopped_client_ids)} stopped clients with fresh cookies from database (skipping {len(running_clients)} already running)...")
+        init_results = await asyncio.gather(
+            *[create_and_init_client(client_id) for client_id in stopped_client_ids],
+            return_exceptions=True
+        )
+
+        for result in init_results:
+            if isinstance(result, Exception):
+                logger.error(f"Unexpected error during reinit: {result}")
+                results["failed"].append({"id": "unknown", "error": str(result)})
+            else:
+                client_id, success, error = result
+                if success:
+                    results["success"].append(client_id)
+                else:
+                    results["failed"].append({"id": client_id, "error": error})
+
+        logger.info(f"Reinitialization complete: {len(results['success'])} success, {len(results['failed'])} failed, {len(results['skipped'])} skipped (already running)")
+        return results

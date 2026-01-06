@@ -38,6 +38,36 @@ class GeminiClientWrapper(GeminiClient):
     def __init__(self, client_id: str, **kwargs):
         super().__init__(client_id=client_id, **kwargs)
         self.id = client_id
+        # Statistics tracking
+        self.request_count: int = 0
+        self.error_count: int = 0
+        self.last_error: str | None = None
+        self.last_request_time: float | None = None
+
+    def record_request(self, success: bool = True, error: str | None = None) -> None:
+        """Record a request and its result."""
+        import time
+        self.request_count += 1
+        self.last_request_time = time.time()
+        if not success:
+            self.error_count += 1
+            self.last_error = error
+
+    def get_error_rate(self) -> float:
+        """Get error rate as a percentage."""
+        if self.request_count == 0:
+            return 0.0
+        return round((self.error_count / self.request_count) * 100, 2)
+
+    def get_stats(self) -> dict:
+        """Get client statistics."""
+        return {
+            "request_count": self.request_count,
+            "error_count": self.error_count,
+            "error_rate": self.get_error_rate(),
+            "last_error": self.last_error,
+            "last_request_time": self.last_request_time,
+        }
 
     async def init(
         self,

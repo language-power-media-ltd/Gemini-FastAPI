@@ -584,8 +584,11 @@ async def create_chat_completion(
     pool = GeminiClientPool()
     try:
         response = await _send_with_split(session, model_input, files=files, image_generation=enable_image_generation)
+        # Record successful request
+        pool.record_request(client_id, success=True)
     except UsageLimitExceeded as exc:
         logger.warning(f"Usage limit exceeded for client {client_id} on model {request.model}: {exc}")
+        pool.record_request(client_id, success=False, error="UsageLimitExceeded")
         # Handle: add cooldown and remove from pool
         await pool.handle_usage_limit_exceeded(client_id, request.model)
         raise HTTPException(
@@ -594,6 +597,7 @@ async def create_chat_completion(
         ) from exc
     except AccountBanned as exc:
         logger.error(f"Account banned for client {client_id}: {exc}")
+        pool.record_request(client_id, success=False, error="AccountBanned")
         # Handle: disable account in database and remove from pool
         await pool.handle_account_banned(client_id)
         raise HTTPException(
@@ -602,6 +606,7 @@ async def create_chat_completion(
         ) from exc
     except TemporarilyBlocked as exc:
         logger.warning(f"IP temporarily blocked for client {client_id}: {exc}")
+        pool.record_request(client_id, success=False, error="IPBlocked")
         # Handle: change proxy and reload client
         await pool.handle_ip_blocked(client_id)
         raise HTTPException(
@@ -610,6 +615,7 @@ async def create_chat_completion(
         ) from exc
     except APIError as exc:
         logger.warning(f"Gemini API returned invalid response for client {client_id}: {exc}")
+        pool.record_request(client_id, success=False, error="APIError")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Gemini temporarily returned an invalid response. Please retry.",
@@ -618,6 +624,7 @@ async def create_chat_completion(
         raise
     except Exception as e:
         logger.exception(f"Unexpected error generating content from Gemini API: {e}")
+        pool.record_request(client_id, success=False, error=str(e)[:100])
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Gemini returned an unexpected error.",
@@ -865,9 +872,12 @@ async def create_response(
             f"Client ID: {client_id}, Input length: {len(model_input)}, files count: {len(files)}"
         )
         model_output = await _send_with_split(session, model_input, files=files, image_generation=enable_image_generation)
+        # Record successful request
+        pool.record_request(client_id, success=True)
     except UsageLimitExceeded as exc:
         client_id = client.id if client else "unknown"
         logger.warning(f"Usage limit exceeded for client {client_id} on model {request_data.model}: {exc}")
+        pool.record_request(client_id, success=False, error="UsageLimitExceeded")
         await pool.handle_usage_limit_exceeded(client_id, request_data.model)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -876,6 +886,7 @@ async def create_response(
     except AccountBanned as exc:
         client_id = client.id if client else "unknown"
         logger.error(f"Account banned for client {client_id}: {exc}")
+        pool.record_request(client_id, success=False, error="AccountBanned")
         await pool.handle_account_banned(client_id)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -884,6 +895,7 @@ async def create_response(
     except TemporarilyBlocked as exc:
         client_id = client.id if client else "unknown"
         logger.warning(f"IP temporarily blocked for client {client_id}: {exc}")
+        pool.record_request(client_id, success=False, error="IPBlocked")
         await pool.handle_ip_blocked(client_id)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -892,6 +904,7 @@ async def create_response(
     except APIError as exc:
         client_id = client.id if client else "unknown"
         logger.warning(f"Gemini API returned invalid response for client {client_id}: {exc}")
+        pool.record_request(client_id, success=False, error="APIError")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Gemini temporarily returned an invalid response. Please retry.",
@@ -900,6 +913,7 @@ async def create_response(
         raise
     except Exception as e:
         logger.exception(f"Unexpected error generating content from Gemini API for responses: {e}")
+        pool.record_request(client_id if client else "unknown", success=False, error=str(e)[:100])
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Gemini returned an unexpected error.",
@@ -1282,6 +1296,7 @@ def _create_real_streaming_response(
         except UsageLimitExceeded as e:
             logger.warning(f"Usage limit exceeded during streaming for client {client.id} on model {model_name}: {e}")
             pool = GeminiClientPool()
+            pool.record_request(client.id, success=False, error="UsageLimitExceeded")
             await pool.handle_usage_limit_exceeded(client.id, model_name)
             error_data = {
                 "id": completion_id,
@@ -1294,6 +1309,7 @@ def _create_real_streaming_response(
         except AccountBanned as e:
             logger.error(f"Account banned during streaming for client {client.id}: {e}")
             pool = GeminiClientPool()
+            pool.record_request(client.id, success=False, error="AccountBanned")
             await pool.handle_account_banned(client.id)
             error_data = {
                 "id": completion_id,
@@ -1306,6 +1322,7 @@ def _create_real_streaming_response(
         except TemporarilyBlocked as e:
             logger.warning(f"IP temporarily blocked during streaming for client {client.id}: {e}")
             pool = GeminiClientPool()
+            pool.record_request(client.id, success=False, error="IPBlocked")
             await pool.handle_ip_blocked(client.id)
             error_data = {
                 "id": completion_id,
@@ -1317,6 +1334,8 @@ def _create_real_streaming_response(
             yield f"data: {orjson.dumps(error_data).decode('utf-8')}\n\n"
         except Exception as e:
             logger.exception(f"Error during streaming: {e}")
+            pool = GeminiClientPool()
+            pool.record_request(client.id, success=False, error=str(e)[:100])
             # Send error as a content chunk
             error_data = {
                 "id": completion_id,
@@ -1365,6 +1384,10 @@ def _create_real_streaming_response(
         }
         yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
         yield "data: [DONE]\n\n"
+
+        # Record successful streaming request
+        pool = GeminiClientPool()
+        pool.record_request(client.id, success=True)
 
         # Save conversation to DB after streaming completes
         if final_output:
