@@ -43,7 +43,7 @@ database:
 
 storage:
   path: "data/lmdb"        # Database storage path
-  max_size: 10737418240     # Maximum database size (10 GB)
+  max_size: 1073741824     # Maximum database size (1 GB)
   retention_days: 1        # Number of days to retain conversations before cleanup
 
 logging:
